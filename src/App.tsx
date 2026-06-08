@@ -1,8 +1,8 @@
 // src/App.tsx
 import React from 'react';
-import { SettingsProvider } from './store/SettingsContext'; // <-- Changed from ./context/
-import { SessionProvider } from './store/SessionContext';   // <-- Changed from ./context/
-import { PoseProvider } from './store/PoseContext';       // <-- Changed from ./context/
+import { SettingsProvider } from './context/SettingsContext';
+import { SessionProvider } from './context/SessionContext';
+import { PoseProvider } from './context/PoseContext';
 import { LiveCoachDashboard } from './components/LiveCoachDashboard';
 
 export default function App() {
