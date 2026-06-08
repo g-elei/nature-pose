@@ -1,20 +1,18 @@
-import { useState } from 'react';
-import { HomeScreen } from './components/screens/HomeScreen';
-import { SessionScreen } from './components/screens/SessionScreen';
-import { DashboardScreen } from './components/screens/DashboardScreen';
+// src/App.tsx
+import React from 'react';
+import { SettingsProvider } from './context/SettingsContext';
+import { SessionProvider } from './context/SessionContext';
+import { PoseProvider } from './context/PoseContext';
+import { LiveCoachDashboard } from './components/LiveCoachDashboard';
 
-type Screen = 'home' | 'session' | 'dashboard';
-
-function App() {
-  const [screen, setScreen] = useState<Screen>('home');
-
+export default function App() {
   return (
-    <>
-      {screen === 'home' && <HomeScreen onStart={() => setScreen('session')} />}
-      {screen === 'session' && <SessionScreen onFinish={() => setScreen('dashboard')} />}
-      {screen === 'dashboard' && <DashboardScreen onBack={() => setScreen('home')} />}
-    </>
+    <SettingsProvider>
+      <SessionProvider>
+        <PoseProvider>
+          <LiveCoachDashboard />
+        </PoseProvider>
+      </SessionProvider>
+    </SettingsProvider>
   );
 }
-
-export default App;

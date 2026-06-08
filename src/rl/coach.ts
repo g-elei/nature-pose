@@ -1,146 +1,86 @@
+// src/rl/coach.ts
+import * as tf from '@tensorflow/tfjs-core';
+import { Keypoint } from '../types/pose';
 import { RunningMetrics } from '../pose/analyzer';
-import { ActivityKind } from '../types/session';
-
-/*
- * ── Real DQN (future upgrade) ──
- * State: [kneeAvg, torsoLean, armSwing, heelStrike, activity, prevAction]
- * Actions: same actionId strings
- * Reward: +1 if next-state score improves, -1 if degrades, +5 if composite >80
- * Model: 2 dense layers (64, 32), epsilon‑greedy with epsilon=0.1
- * Training: requires 10k+ labeled transitions from recorded sessions
- *
- * ── Simulated RL (current) ──
- * Same input/output interface. Deterministic rule‑based thresholds.
- * Zero training data. Swap path: replace function body with model.predict().
- */
+import { headTilt, hipTilt } from '../pose/angles';
 
 export interface CoachAction {
-  actionId: string;
-  advice: string;
-  voiceCue: string;
-  severity: 'good' | 'warning' | 'critical';
-  scoreDelta: number;   // penalty applied to composite score
+  actionId: string; // Used as dictionary key in SessionContext summary telemetry
+  text: string;     // Read aloud by Web Speech API / displayed in UI
 }
 
-export function getCoachingActions(
-  metrics: RunningMetrics,
-  activity: ActivityKind
-): CoachAction[] {
-  const actions: CoachAction[] = [];
+export const COACH_ACTIONS = [
+  "Form is excellent. Maintain this standard!", 
+  "Straighten your spine. Avoid slouching.",     
+  "Drive your knees higher to increase power.",  
+  "Relax your shoulders and pump your arms.",    
+  "Engage your core to stabilize your hips.",    
+  "Keep your gaze forward and head level."       
+];
 
-  if (activity === 'running') {
-    const { kneeAvg, torsoLean, isHeelStrike, armSwingRatio } = metrics;
-    if (kneeAvg < 60 || kneeAvg > 130) {
-      actions.push({
-        actionId: 'knee_critical',
-        advice: 'Your knee angle is extreme – focus on a mid‑range bend',
-        voiceCue: 'Knee angle extreme',
-        severity: 'critical',
-        scoreDelta: -25,
-      });
-    } else if (kneeAvg < 80 || kneeAvg > 110) {
-      actions.push({
-        actionId: 'knee_warning',
-        advice: 'Slightly adjust your knee bend',
-        voiceCue: 'Adjust knee bend',
-        severity: 'warning',
-        scoreDelta: -10,
-      });
-    }
+// Consistent string keys to track feedback frequency over the duration of a session
+const ACTION_IDS = [
+  "optimal",
+  "slouching",
+  "low-knee-drive",
+  "poor-arm-swing",
+  "hip-instability",
+  "head-drop"
+];
 
-    if (torsoLean < 3 || torsoLean > 20) {
-      actions.push({
-        actionId: 'torso_critical',
-        advice: 'Your torso lean is too extreme – keep a neutral spine',
-        voiceCue: 'Neutral spine',
-        severity: 'critical',
-        scoreDelta: -25,
-      });
-    } else if (torsoLean < 5 || torsoLean > 15) {
-      actions.push({
-        actionId: 'torso_warning',
-        advice: 'Slightly adjust your forward lean',
-        voiceCue: 'Adjust lean',
-        severity: 'warning',
-        scoreDelta: -10,
-      });
-    }
+/**
+ * Loads the pre-trained neural network policy parameters from your public assets folder
+ */
+export async function loadCoachPolicy() {
+  // Pointing to your public assets folder (Vercel uses root domain routing)
+  return await tf.loadLayersModel('/rl-models/coach_policy.json');
+}
 
-    if (isHeelStrike) {
-      actions.push({
-        actionId: 'heel_strike',
-        advice: 'Land on your midfoot, not your heel',
-        voiceCue: 'Midfoot landing',
-        severity: 'critical',
-        scoreDelta: -25,
-      });
-    }
+/**
+ * Extracts raw coordinate arrays and outputs a structured 1D state tensor [1, 8]
+ */
+export function buildStateVector(keypoints: Keypoint[], metrics: RunningMetrics): number[] {
+  const leftEar = keypoints[3] || { x: 0, y: 0, score: 0 };
+  const rightEar = keypoints[4] || { x: 0, y: 0, score: 0 };
+  const leftHip = keypoints[11] || { x: 0, y: 0, score: 0 };
+  const rightHip = keypoints[12] || { x: 0, y: 0, score: 0 };
 
-    if (armSwingRatio < 0.3) {
-      actions.push({
-        actionId: 'arms_critical',
-        advice: 'Pump your arms more',
-        voiceCue: 'Pump arms',
-        severity: 'critical',
-        scoreDelta: -25,
-      });
-    } else if (armSwingRatio < 0.5) {
-      actions.push({
-        actionId: 'arms_warning',
-        advice: 'Increase your arm swing',
-        voiceCue: 'More arm swing',
-        severity: 'warning',
-        scoreDelta: -10,
-      });
-    }
-  } else if (activity === 'yoga') {
-    if (metrics.torsoLean < 80 || metrics.torsoLean > 100) {
-      actions.push({
-        actionId: 'yoga_spine',
-        advice: 'Lengthen your spine, avoid rounding',
-        voiceCue: 'Lengthen spine',
-        severity: 'warning',
-        scoreDelta: -10,
-      });
-    }
-    if (metrics.armSwingRatio < 0.2) {
-      actions.push({
-        actionId: 'yoga_arms',
-        advice: 'Reach through your arms more',
-        voiceCue: 'Reach arms',
-        severity: 'warning',
-        scoreDelta: -10,
-      });
-    }
-  } else if (activity === 'sitting') {
-    if (metrics.torsoLean < 70 || metrics.torsoLean > 110) {
-      actions.push({
-        actionId: 'sit_spine',
-        advice: 'Sit upright with your back against the chair',
-        voiceCue: 'Sit up straight',
-        severity: 'critical',
-        scoreDelta: -25,
-      });
-    } else if (metrics.torsoLean < 80 || metrics.torsoLean > 100) {
-      actions.push({
-        actionId: 'sit_slight',
-        advice: 'Straighten your back a little',
-        voiceCue: 'Straighten back',
-        severity: 'warning',
-        scoreDelta: -10,
-      });
-    }
-  }
+  const headTiltVal = headTilt(leftEar, rightEar);
+  const hipTiltVal = hipTilt(leftHip, rightHip);
 
-  if (actions.length === 0) {
-    actions.push({
-      actionId: 'good_job',
-      advice: 'Great form! Keep it up',
-      voiceCue: 'Looking good',
-      severity: 'good',
-      scoreDelta: 0,
-    });
-  }
+  return [
+    Math.min(Math.max((metrics.torsoLean || 0) / 90.0, 0), 1),
+    Math.min(Math.max((metrics.kneeLeft || 0) / 180.0, 0), 1),
+    Math.min(Math.max((metrics.kneeRight || 0) / 180.0, 0), 1),
+    Math.min(Math.max((metrics.hipExtension || 0) / 180.0, 0), 1),
+    Math.min(Math.max((metrics.armSwingRatio || 0), 0), 1),
+    Math.min(Math.max(hipTiltVal / 45.0, 0), 1),
+    Math.min(Math.max(headTiltVal / 45.0, 0), 1),
+    Math.min(Math.max((metrics.cadence || 0) / 240.0, 0), 1)
+  ];
+}
 
-  return actions;
+/**
+ * Computes forward propagation and resolves the highest probability argmax index
+ */
+export function evaluatePoseRL(model: any, stateFeatures: number[]): CoachAction {
+  return tf.tidy(() => {
+    const inputTensor = tf.tensor2d([stateFeatures], [1, 8]);
+    const prediction = model.predict(inputTensor) as tf.Tensor;
+    const outputData = prediction.dataSync();
+    
+    let maxIdx = 0;
+    let maxVal = outputData[0];
+    for (let i = 1; i < outputData.length; i++) {
+      if (outputData[i] > maxVal) {
+        maxVal = outputData[i];
+        maxIdx = i;
+      }
+    }
+    
+    return {
+      actionId: ACTION_IDS[maxIdx] || "unknown",
+      text: COACH_ACTIONS[maxIdx] || COACH_ACTIONS[0]
+    };
+  });
 }

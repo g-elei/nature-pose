@@ -1,15 +1,18 @@
+// src/hooks/usePoseDetection.ts
 import { useEffect, useRef } from 'react';
 import { createDetector } from '../lib/poseDetector';
 import { analyzeRunning, analyzeWalking, analyzeYoga, analyzeSitting, RunningMetrics } from '../pose/analyzer';
 import { drawSkeleton, drawKeypoints } from '../pose/skeleton';
 import { ActivityKind } from '../types/session';
 import { Keypoint } from '../types/pose';
+import { loadCoachPolicy, buildStateVector, evaluatePoseRL, CoachAction } from '../rl/coach';
 
 interface UsePoseDetectionOptions {
   videoRef: React.RefObject<HTMLVideoElement>;
   canvasRef: React.RefObject<HTMLCanvasElement>;
   activity: ActivityKind;
-  onResult: (metrics: RunningMetrics, keypoints: Keypoint[]) => void;
+  // Updated onResult parameter to emit the active frame inference out to your dashboard layout context
+  onResult: (metrics: RunningMetrics, keypoints: Keypoint[], coachAction: CoachAction | null) => void;
   enabled?: boolean;
 }
 
@@ -26,8 +29,13 @@ export function usePoseDetection({
   const fpsRef = useRef(0);
   const frameCountRef = useRef(0);
   const lastFpsUpdateRef = useRef(performance.now());
+  
   const detectorRef = useRef<any>(null);
   const detectorLoadingRef = useRef(false);
+
+  // Added references to handle neural-network lifecycle management in sync with user loop
+  const coachModelRef = useRef<any>(null);
+  const coachLoadingRef = useRef(false);
 
   useEffect(() => {
     if (!enabled) return;
@@ -49,7 +57,6 @@ export function usePoseDetection({
 
       const now = performance.now();
 
-      // Resize canvas to match video
       if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
@@ -61,10 +68,9 @@ export function usePoseDetection({
         return;
       }
 
-      // Draw video frame onto canvas so user sees camera feed
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-      // Load detector lazily (once)
+      // Lazily instantiate MoveNet Estimator
       if (!detectorRef.current && !detectorLoadingRef.current) {
         detectorLoadingRef.current = true;
         try {
@@ -75,13 +81,23 @@ export function usePoseDetection({
         detectorLoadingRef.current = false;
       }
 
+      // Lazily instantiate pre-trained RL Coach Inference Model
+      if (!coachModelRef.current && !coachLoadingRef.current) {
+        coachLoadingRef.current = true;
+        try {
+          coachModelRef.current = await loadCoachPolicy();
+        } catch (e) {
+          console.error('Failed to load RL coach policy:', e);
+        }
+        coachLoadingRef.current = false;
+      }
+
       const detector = detectorRef.current;
       if (!detector) {
         frameIdRef.current = requestAnimationFrame(loop);
         return;
       }
 
-      // FPS counter
       frameCountRef.current++;
       if (now - lastFpsUpdateRef.current >= 1000) {
         fpsRef.current = frameCountRef.current;
@@ -89,7 +105,6 @@ export function usePoseDetection({
         lastFpsUpdateRef.current = now;
       }
 
-      // Run pose estimation
       try {
         const poses = await detector.estimatePoses(video);
         if (poses.length > 0 && poses[0].keypoints) {
@@ -119,8 +134,16 @@ export function usePoseDetection({
               metrics = analyzeRunning(keypoints);
           }
 
+          // Evaluate the frame using RL Policy model
+          let currentAction: CoachAction | null = null;
+          if (coachModelRef.current) {
+            const stateFeatures = buildStateVector(keypoints, metrics);
+            currentAction = evaluatePoseRL(coachModelRef.current, stateFeatures);
+          }
+
+          // Emit metrics and model evaluation results down to active consumer hooks every 200ms
           if (now - lastCallbackTimeRef.current >= 200) {
-            onResult(metrics, keypoints);
+            onResult(metrics, keypoints, currentAction);
             lastCallbackTimeRef.current = now;
           }
 
@@ -128,7 +151,7 @@ export function usePoseDetection({
           drawKeypoints(ctx, keypoints, '#ff4444');
         }
       } catch (e) {
-        // Silently retry next frame
+        // Fallthrough protection to ensure frame drops don't completely lock thread execution
       }
 
       frameIdRef.current = requestAnimationFrame(loop);
