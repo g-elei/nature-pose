@@ -3,5 +3,8 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
-  base: '/',   // ← must be '/' for root‑hosted platforms like Vercel
+  base: '/',
+  optimizeDeps: {
+    include: ['@tensorflow/tfjs-core', '@tensorflow/tfjs-backend-webgl', 'long'],
+  },
 });
