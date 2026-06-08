@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useCallback, useState } from 'react';
 import { useSettings } from '../../store/SettingsContext';
 import { useSession } from '../../store/SessionContext';
-import { usePoseUpdate } from '../../store/PoseContext';
+import { usePose, usePoseUpdate } from '../../store/PoseContext';
 import { usePoseDetection } from '../../hooks/usePoseDetection';
 import { useCamera } from '../../hooks/useCamera';
 import { useCanvas } from '../../hooks/useCanvas';
@@ -33,6 +33,7 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({ onFinish }) => {
   const { activity, voiceMuted } = useSettings();
   const { startSession, recordFrame, endSession } = useSession();
   const updatePose = usePoseUpdate();
+  const { keypoints } = usePose();
 
   const { videoRef, start: startCamera, stop: stopCamera, error: cameraError } = useCamera();
   const { canvasRef } = useCanvas();
@@ -45,10 +46,11 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({ onFinish }) => {
   const lastActionsRef = useRef<any[]>([]);
   const uploadedVideoRef = useRef<HTMLVideoElement | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [videoDimensions, setVideoDimensions] = useState({ w: 640, h: 480 });
 
-  const onPoseResult = useCallback((metrics: RunningMetrics, keypoints: Keypoint[]) => {
+  const onPoseResult = useCallback((metrics: RunningMetrics, kp: Keypoint[]) => {
     setLastMetrics(metrics);
-    updatePose(keypoints, metrics, 30);
+    updatePose(kp, metrics, 30);
 
     const actions = getCoachingActions(metrics, activity);
     setLastActions(actions);
@@ -68,11 +70,11 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({ onFinish }) => {
     }
   }, [activity, updatePose, recordFrame, speak, voiceMuted]);
 
-  const detectVideoSource = inputMode === 'camera' ? videoRef.current : uploadedVideoRef.current;
+  const detectVideoRef = inputMode === 'camera' ? videoRef : uploadedVideoRef;
 
   usePoseDetection({
-    videoElement: detectVideoSource,
-    canvasElement: canvasRef.current,
+    videoRef: detectVideoRef as React.RefObject<HTMLVideoElement>,
+    canvasRef,
     activity,
     onResult: onPoseResult,
     enabled: inputMode === 'camera' || inputMode === 'video',
@@ -83,6 +85,19 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({ onFinish }) => {
     startCamera();
     return () => { stopCamera(); };
   }, []);
+
+  useEffect(() => {
+    if (videoRef.current) {
+      const checkDimensions = setInterval(() => {
+        const v = videoRef.current;
+        if (v && v.videoWidth > 0) {
+          setVideoDimensions({ w: v.videoWidth, h: v.videoHeight });
+          clearInterval(checkDimensions);
+        }
+      }, 100);
+      return () => clearInterval(checkDimensions);
+    }
+  }, [videoRef.current]);
 
   const handleImageUpload = useCallback(async (file: File) => {
     setUploadError(null);
@@ -100,6 +115,7 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({ onFinish }) => {
           const kp = (poses[0].keypoints as unknown) as Keypoint[];
           const analyze = ANALYZE_FN[activity] || analyzeRunning;
           const metrics = analyze(kp);
+          updatePose(kp, metrics, 0);
           setLastMetrics(metrics);
           const actions = getCoachingActions(metrics, activity);
           setLastActions(actions);
@@ -119,7 +135,7 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({ onFinish }) => {
     img.onerror = () => setUploadError('Failed to load image');
     img.src = URL.createObjectURL(file);
     setInputMode('image');
-  }, [activity, recordFrame, speak, voiceMuted]);
+  }, [activity, recordFrame, speak, voiceMuted, updatePose]);
 
   const handleVideoUpload = useCallback(async (file: File) => {
     setUploadError(null);
@@ -131,6 +147,7 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({ onFinish }) => {
     video.onloadeddata = () => {
       video.play().catch(() => setUploadError('Failed to play video'));
       uploadedVideoRef.current = video;
+      setVideoDimensions({ w: video.videoWidth, h: video.videoHeight });
       setInputMode('video');
     };
     video.onerror = () => setUploadError('Failed to load video');
@@ -145,11 +162,18 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({ onFinish }) => {
     <div className="min-h-screen bg-cream-100 flex flex-col">
       <div className="flex-1 relative">
         {(cameraError || uploadError) && (
-          <div className="absolute inset-0 flex items-center justify-center bg-cream-50 z-20">
-            <p className="text-red-600 text-sm">{cameraError || uploadError}</p>
+          <div className="absolute inset-0 z-20 flex items-center justify-center bg-cream-50">
+            <p className="rounded-lg bg-red-100 px-4 py-2 text-sm text-red-700">
+              {cameraError || uploadError}
+            </p>
           </div>
         )}
-        <CameraFeed videoRef={videoRef} canvasRef={canvasRef} />
+        <CameraFeed
+          videoRef={videoRef}
+          canvasRef={canvasRef}
+          width={videoDimensions.w}
+          height={videoDimensions.h}
+        />
         {inputMode === 'video' && uploadedVideoRef.current && (
           <video
             ref={uploadedVideoRef as React.Ref<HTMLVideoElement>}
@@ -160,11 +184,11 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({ onFinish }) => {
           />
         )}
         <FramingGuide
-          framing={useFramingGuide([], 640, 480)}
+          framing={useFramingGuide(keypoints, videoDimensions.w, videoDimensions.h)}
         />
       </div>
 
-      <div className="bg-cream-50 border-t border-sage-200 p-4 space-y-3">
+      <div className="space-y-3 border-t border-sage-200 bg-cream-50 p-4">
         {lastMetrics && (
           <div className="grid grid-cols-2 gap-3">
             <MetricBar
