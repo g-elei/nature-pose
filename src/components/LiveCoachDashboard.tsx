@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { useSettings } from '../store/SettingsContext';
 import { useSession } from '../store/SessionContext';
 import { usePose, usePoseUpdate } from '../store/PoseContext';
@@ -9,13 +9,13 @@ import { useVoiceCoach } from '../hooks/useVoiceCoach';
 import { loadCoachPolicy, evaluatePoseRL } from '../rl/coach';
 import { ActivityKind } from '../types/session';
 import { RunningMetrics } from '../pose/analyzer';
-import * as tf from '@tensorflow/tfjs-core';
 
 export function LiveCoachDashboard() {
   // Contexts
   const { activity, setActivity, voiceMuted, setVoiceMuted } = useSettings();
   const { currentSession, sessions, startSession, recordFrame, endSession } = useSession();
-  const { metrics, keypoints } = usePose();
+  // From: const { metrics, keypoints } = usePose();
+const { metrics } = usePose();
   const updatePose = usePoseUpdate();
 
   // Custom Hooks
@@ -24,7 +24,7 @@ export function LiveCoachDashboard() {
   const { speak, stop: stopVoice } = useVoiceCoach();
 
   // States
-  const [model, setModel] = useState<tf.LayersModel | null>(null);
+const [model, setModel] = useState<any>(null);
   const [coachFeedback, setCoachFeedback] = useState<string>('Awaiting motion input to coach your form...');
   const lastFeedbackTime = useRef<number>(0);
 
@@ -70,19 +70,12 @@ export function LiveCoachDashboard() {
       
       const actionIndex = evaluatePoseRL(model, inputVector);
       
-      // Map index policy actions to human cues
-      const policyActions: Record<number, { id: string; text: string }> = {
-        0: { id: 'excellent', text: 'Excellent alignment! Keep this posture.' },
-        1: { id: 'posture', text: 'Straighten your torso. Avoid leaning too far forward.' },
-        2: { id: 'knees', text: 'Drive your knees slightly higher to improve power.' },
-        3: { id: 'arms', text: 'Relax your shoulders and keep your arms at ninety degrees.' },
-        4: { id: 'cadence', text: 'Shorten your stride slightly to optimize cadence.' },
-      };
 
-      if (policyActions[actionIndex]) {
-        actionId = policyActions[actionIndex].id;
-        actionText = policyActions[actionIndex].text;
-      }
+      //  Directly read the properties from the coach action object
+if (actionIndex) {
+  actionId = actionIndex.actionId; 
+  actionText = actionIndex.text;
+}
     } else if (latestMetrics) {
       // Rule-based feedback fallback if model is still loading
       if (latestMetrics.torsoLean > 15) {
@@ -105,7 +98,12 @@ export function LiveCoachDashboard() {
 
     // 4. Append frame metrics to database if a recording session is running
     if (currentSession) {
-      recordFrame(latestMetrics.score || 0, [{ actionId, text: actionText }]);
+      recordFrame(latestMetrics.score || 0, [{ 
+  actionId, 
+  text: actionText, 
+  advice: actionText, 
+  voiceCue: actionText 
+}]);
     }
   };
 

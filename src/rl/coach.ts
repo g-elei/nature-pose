@@ -1,12 +1,14 @@
 // src/rl/coach.ts
-import * as tf from '@tensorflow/tfjs-core';
 import { Keypoint } from '../types/pose';
 import { RunningMetrics } from '../pose/analyzer';
 import { headTilt, hipTilt } from '../pose/angles';
 
 export interface CoachAction {
-  actionId: string; // Used as dictionary key in SessionContext summary telemetry
-  text: string;     // Read aloud by Web Speech API / displayed in UI
+  actionId: string; 
+  text: string;     
+  advice: string;   
+  voiceCue: string; 
+  severity?: 'good' | 'warning' | 'critical'; // Added to support SessionScreen check loops
 }
 
 export const COACH_ACTIONS = [
@@ -18,7 +20,6 @@ export const COACH_ACTIONS = [
   "Keep your gaze forward and head level."       
 ];
 
-// Consistent string keys to track feedback frequency over the duration of a session
 const ACTION_IDS = [
   "optimal",
   "slouching",
@@ -28,18 +29,37 @@ const ACTION_IDS = [
   "head-drop"
 ];
 
-/**
- * Bypasses the non-existent JSON model asset and returns a safe fallback token
- */
 export async function loadCoachPolicy() {
   console.warn('coach_policy.json not present. Activating heuristic rule-engine.');
-  // Return a mock model signature so initialization hooks resolve successfully
   return { isMockModel: true };
 }
 
 /**
- * Extracts raw coordinate arrays and outputs a structured 1D state array
+ * Fixes TS2554, TS2345, and TS2339 in SessionScreen.tsx
+ * Accepts metric telemetry data and structures it into proper CoachAction objects.
  */
+export function getCoachingActions(metrics: any, _activity?: any): CoachAction[] {
+  const torsoLeanDegrees = metrics?.torsoLean || 0;
+  let chosenIdx = 0;
+
+  if (torsoLeanDegrees > 25) {
+    chosenIdx = 1; // slouching
+  }
+
+  const textOutput = COACH_ACTIONS[chosenIdx] || COACH_ACTIONS[0];
+  const severityOutput = torsoLeanDegrees > 25 ? 'warning' : 'good';
+
+  return [
+    {
+      actionId: ACTION_IDS[chosenIdx] || "optimal",
+      text: textOutput,
+      advice: textOutput,
+      voiceCue: textOutput,
+      severity: severityOutput
+    }
+  ];
+}
+
 export function buildStateVector(keypoints: Keypoint[], metrics: RunningMetrics): number[] {
   const leftEar = keypoints[3] || { x: 0, y: 0, score: 0 };
   const rightEar = keypoints[4] || { x: 0, y: 0, score: 0 };
@@ -49,47 +69,45 @@ export function buildStateVector(keypoints: Keypoint[], metrics: RunningMetrics)
   const headTiltVal = headTilt(leftEar, rightEar);
   const hipTiltVal = hipTilt(leftHip, rightHip);
 
-  // Normalizes body metrics consistently between 0.0 and 1.0
   return [
-    Math.min(Math.max((metrics.torsoLean || 0) / 90.0, 0), 1),       // index 0
-    Math.min(Math.max((metrics.kneeLeft || 0) / 180.0, 0), 1),       // index 1
-    Math.min(Math.max((metrics.kneeRight || 0) / 180.0, 0), 1),      // index 2
-    Math.min(Math.max((metrics.hipExtension || 0) / 180.0, 0), 1),   // index 3
-    Math.min(Math.max((metrics.armSwingRatio || 0), 0), 1),          // index 4
-    Math.min(Math.max(hipTiltVal / 45.0, 0), 1),                     // index 5
-    Math.min(Math.max(headTiltVal / 45.0, 0), 1),                    // index 6
-    Math.min(Math.max((metrics.cadence || 0) / 240.0, 0), 1)         // index 7
+    Math.min(Math.max((metrics.torsoLean || 0) / 90.0, 0), 1),       
+    Math.min(Math.max((metrics.kneeLeft || 0) / 180.0, 0), 1),       
+    Math.min(Math.max((metrics.kneeRight || 0) / 180.0, 0), 1),      
+    Math.min(Math.max((metrics.hipExtension || 0) / 180.0, 0), 1),   
+    Math.min(Math.max((metrics.armSwingRatio || 0), 0), 1),          
+    Math.min(Math.max(hipTiltVal / 45.0, 0), 1),                     
+    Math.min(Math.max(headTiltVal / 45.0, 0), 1),                    
+    Math.min(Math.max((metrics.cadence || 0) / 240.0, 0), 1)         
   ];
 }
 
-/**
- * Evaluates features using safe kinematic heuristics instead of a neural network file
- */
-export function evaluatePoseRL(model: any, stateFeatures: number[]): CoachAction {
-  // Reconstruct real-world values from the normalized state array
+export function evaluatePoseRL(_model: any, stateFeatures: number[]): CoachAction {
   const torsoLeanDegrees = stateFeatures[0] * 90;
   const avgKneeFlexion = ((stateFeatures[1] + stateFeatures[2]) / 2) * 180;
   const armSwingRatio = stateFeatures[4];
   const hipTiltDegrees = stateFeatures[5] * 45;
   const headTiltDegrees = stateFeatures[6] * 45;
 
-  let chosenIdx = 0; // Default to "optimal" Form
+  let chosenIdx = 0; 
 
-  // Evaluate kinematic rules hierarchically
   if (torsoLeanDegrees > 25) {
-    chosenIdx = 1; // slouching
+    chosenIdx = 1; 
   } else if (headTiltDegrees > 15) {
-    chosenIdx = 5; // head-drop
+    chosenIdx = 5; 
   } else if (armSwingRatio < 0.25) {
-    chosenIdx = 3; // poor-arm-swing
+    chosenIdx = 3; 
   } else if (hipTiltDegrees > 12) {
-    chosenIdx = 4; // hip-instability
+    chosenIdx = 4; 
   } else if (avgKneeFlexion < 45 && stateFeatures[7] > 0.1) { 
-    chosenIdx = 2; // low-knee-drive
+    chosenIdx = 2; 
   }
+
+  const textOutput = COACH_ACTIONS[chosenIdx] || COACH_ACTIONS[0];
 
   return {
     actionId: ACTION_IDS[chosenIdx] || "optimal",
-    text: COACH_ACTIONS[chosenIdx] || COACH_ACTIONS[0]
+    text: textOutput,
+    advice: textOutput,   
+    voiceCue: textOutput  
   };
 }

@@ -56,9 +56,10 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({ onFinish }) => {
     setLastActions(actions);
     lastActionsRef.current = actions;
 
-    const sev = actions.some((a) => a.severity === 'critical')
+    const sev = actions.some((a: any) => a.severity === 'critical')
+  
       ? 'critical'
-      : actions.some((a) => a.severity === 'warning')
+     : actions.some((a: any) => a.severity === 'warning')
         ? 'warning'
         : 'good';
     setSeverity(sev);
@@ -120,8 +121,8 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({ onFinish }) => {
           const actions = getCoachingActions(metrics, activity);
           setLastActions(actions);
           lastActionsRef.current = actions;
-          const sev = actions.some((a) => a.severity === 'critical') ? 'critical'
-            : actions.some((a) => a.severity === 'warning') ? 'warning' : 'good';
+          const sev = actions.some((a: any) => a.severity === 'critical') ? 'critical'
+  : actions.some((a: any) => a.severity === 'warning') ? 'warning' : 'good';
           setSeverity(sev);
           recordFrame(metrics.score, actions);
           if (!voiceMuted && actions.length > 0) speak(actions[0].voiceCue);
