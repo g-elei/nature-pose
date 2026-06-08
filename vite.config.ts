@@ -1,13 +1,14 @@
+// vite.config.ts
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import tailwindcss from '@tailwindcss/vite'; // <-- Add this import
+import tailwindcss from '@tailwindcss/vite'; // 1. Add this import
 
 export default defineConfig({
   plugins: [
-    react(), 
-    tailwindcss() // <-- Register the Tailwind compiler plugin
+    react(),
+    tailwindcss(), // 2. Add the compiler plugin right here
   ],
-  base: '/', // <-- Fix base path to match package.json homepage
+  base: '/',
   optimizeDeps: {
     include: ['@tensorflow/tfjs-core', '@tensorflow/tfjs-backend-webgl', 'long'],
   },

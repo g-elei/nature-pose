@@ -1,249 +1,437 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
+import { useSettings } from '../store/SettingsContext';
+import { useSession } from '../store/SessionContext';
+import { usePose, usePoseUpdate } from '../store/PoseContext';
 import { useCamera } from '../hooks/useCamera';
+import { useCanvas } from '../hooks/useCanvas';
 import { usePoseDetection } from '../hooks/usePoseDetection';
-import { useSession } from '../context/SessionContext';
 import { useVoiceCoach } from '../hooks/useVoiceCoach';
-import { useSettings } from '../context/SettingsContext';
+import { loadCoachPolicy, evaluatePoseRL } from '../rl/coach';
+import { ActivityKind } from '../types/session';
 import { RunningMetrics } from '../pose/analyzer';
-import { checkFraming, FramingResult } from '../pose/framing';
-import { CoachAction } from '../rl/coach';
+import * as tf from '@tensorflow/tfjs-core';
 
-export const LiveCoachDashboard: React.FC = () => {
-  // 1. Core Ecosystem Hooks
-  const { videoRef, start, stop, isActive: isCameraActive, error: cameraError } = useCamera('user');
-  const canvasRef = React.useRef<HTMLCanvasElement>(null);
-  
-  const { activity, voiceMuted, setVoiceMuted } = useSettings();
-  const { currentSession, startSession, recordFrame, endSession } = useSession();
-  const { speak, stop: stopVoice, toggleMute } = useVoiceCoach();
+export function LiveCoachDashboard() {
+  // Contexts
+  const { activity, setActivity, voiceMuted, setVoiceMuted } = useSettings();
+  const { currentSession, sessions, startSession, recordFrame, endSession } = useSession();
+  const { metrics, keypoints } = usePose();
+  const updatePose = usePoseUpdate();
 
-  // 2. High-Frequency UI State
-  const [metrics, setMetrics] = useState<RunningMetrics | null>(null);
-  const [liveAction, setLiveAction] = useState<CoachAction | null>(null);
-  const [framingGuide, setFramingGuide] = useState<FramingResult | null>(null);
+  // Custom Hooks
+  const { videoRef, start: startCamera, stop: stopCamera, isActive: isCameraActive, error: cameraError } = useCamera('user');
+  const { canvasRef, resizeCanvas } = useCanvas();
+  const { speak, stop: stopVoice } = useVoiceCoach();
 
-  // Sync vocal state with settings adjustments
+  // States
+  const [model, setModel] = useState<tf.LayersModel | null>(null);
+  const [coachFeedback, setCoachFeedback] = useState<string>('Awaiting motion input to coach your form...');
+  const lastFeedbackTime = useRef<number>(0);
+
+  // Load the AI Coach Policy on mount
+  useEffect(() => {
+    async function initModel() {
+      try {
+        const loadedModel = await loadCoachPolicy();
+        setModel(loadedModel);
+        console.log('AI Coach reinforcement learning model loaded successfully.');
+      } catch (err) {
+        console.error('Failed to load RL coach policy, falling back to rule-based cues:', err);
+      }
+    }
+    initModel();
+  }, []);
+
+  // Sync voice muted status from application settings
   useEffect(() => {
     if (voiceMuted) {
       stopVoice();
     }
   }, [voiceMuted, stopVoice]);
 
-  const handleMuteToggle = () => {
-    toggleMute();
-    setVoiceMuted(!voiceMuted);
+  // Handle frame analysis results
+  const handlePoseResult = (latestMetrics: RunningMetrics, latestKeypoints: any[]) => {
+    // 1. Update the shared pose context tracking state
+    updatePose(latestKeypoints, latestMetrics, 0);
+
+    // 2. Evaluate Form via the AI RL Model or fall back to standard metrics
+    let actionText = 'Form is stable. Maintain your rhythm.';
+    let actionId = 'stable';
+
+    if (model && latestMetrics) {
+      // Normalize metrics into standard input vector for the policy neural network
+      const inputVector = [
+        latestMetrics.kneeLeft || 0,
+        latestMetrics.kneeRight || 0,
+        latestMetrics.torsoLean || 0,
+        latestMetrics.armSwingRatio || 0,
+        latestMetrics.hipExtension || 0,
+      ];
+      
+      const actionIndex = evaluatePoseRL(model, inputVector);
+      
+      // Map index policy actions to human cues
+      const policyActions: Record<number, { id: string; text: string }> = {
+        0: { id: 'excellent', text: 'Excellent alignment! Keep this posture.' },
+        1: { id: 'posture', text: 'Straighten your torso. Avoid leaning too far forward.' },
+        2: { id: 'knees', text: 'Drive your knees slightly higher to improve power.' },
+        3: { id: 'arms', text: 'Relax your shoulders and keep your arms at ninety degrees.' },
+        4: { id: 'cadence', text: 'Shorten your stride slightly to optimize cadence.' },
+      };
+
+      if (policyActions[actionIndex]) {
+        actionId = policyActions[actionIndex].id;
+        actionText = policyActions[actionIndex].text;
+      }
+    } else if (latestMetrics) {
+      // Rule-based feedback fallback if model is still loading
+      if (latestMetrics.torsoLean > 15) {
+        actionId = 'posture';
+        actionText = 'Reduce forward lean. Engage your core.';
+      } else if (latestMetrics.score < 70 && latestMetrics.armSwingRatio < 0.3) {
+        actionId = 'arms';
+        actionText = 'Pump your arms in line with your movement direction.';
+      }
+    }
+
+    setCoachFeedback(actionText);
+
+    // 3. Trigger Voice Feedback every 4 seconds max to avoid speaking overlaps
+    const now = performance.now();
+    if (!voiceMuted && now - lastFeedbackTime.current > 4000) {
+      speak(actionText);
+      lastFeedbackTime.current = now;
+    }
+
+    // 4. Append frame metrics to database if a recording session is running
+    if (currentSession) {
+      recordFrame(latestMetrics.score || 0, [{ actionId, text: actionText }]);
+    }
   };
 
-  // 3. Central Stream Telemetry Consumer Pipeline
+  // Connect pose detection loop to refs
   usePoseDetection({
     videoRef,
     canvasRef,
     activity,
+    onResult: handlePoseResult,
     enabled: isCameraActive,
-    onResult: (latestMetrics, latestKeypoints, coachAction) => {
-      setMetrics(latestMetrics);
-      setLiveAction(coachAction);
-
-      // Perform camera safety window checks on the layout thread
-      if (videoRef.current) {
-        const frameCheck = checkFraming(latestKeypoints, videoRef.current.videoWidth, videoRef.current.videoHeight);
-        setFramingGuide(frameCheck);
-      }
-
-      // Record telemetry frame directly to IndexedDB store
-      if (currentSession && coachAction) {
-        recordFrame(latestMetrics.score, [coachAction]);
-      }
-
-      // Voice broadcast
-      if (coachAction && !voiceMuted) {
-        speak(coachAction.text);
-      }
-    }
   });
 
-  // Calculate semantic color themes based on live performance levels
-  const formScore = metrics?.score ?? 0;
-  const scoreColorClass = formScore >= 80 
-    ? 'text-emerald-400 border-emerald-500/30' 
-    : formScore >= 50 
-      ? 'text-amber-400 border-amber-500/30' 
-      : 'text-rose-400 border-rose-500/30';
+  // Adjust canvas bounds on camera activation
+  useEffect(() => {
+    if (isCameraActive && videoRef.current) {
+      const timer = setTimeout(() => {
+        const w = videoRef.current?.videoWidth || 640;
+        const h = videoRef.current?.videoHeight || 480;
+        resizeCanvas(w, h);
+      }, 500);
+      return () => clearTimeout(timer);
+    }
+  }, [isCameraActive, videoRef, resizeCanvas]);
+
+  // Manage Live Track controls
+  const toggleCamera = async () => {
+    if (isCameraActive) {
+      if (currentSession) await handleEndSession();
+      stopCamera();
+    } else {
+      await startCamera();
+    }
+  };
+
+  const handleStartSession = () => {
+    if (!isCameraActive) return;
+    startSession(activity);
+  };
+
+  const handleEndSession = async () => {
+    await endSession();
+  };
+
+  // Export Session History log to CSV formatted spreadsheet
+  const exportHistoryToCSV = () => {
+    if (sessions.length === 0) return;
+    const headers = ['ID', 'Date', 'Activity', 'Duration (s)', 'Average Score'];
+    const rows = sessions.map(s => [
+      s.id || '',
+      s.date,
+      s.activity,
+      Math.round(s.durationMs / 1000),
+      s.averageScore,
+    ]);
+
+    const csvContent = [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `NaturePose_History_${new Date().toISOString().slice(0,10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
 
   return (
-    <div className="min-h-screen bg-stone-950 text-stone-100 p-4 md:p-8 font-sans antialiased selection:bg-emerald-500/30 selection:text-emerald-200">
-      
-      {/* HEADER CONTROLS */}
-      <header className="max-w-7xl mx-auto flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-8 pb-6 border-b border-stone-800">
-        <div>
-          <div className="flex items-center gap-2">
-            <span className="h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse" />
-            <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight bg-gradient-to-r from-stone-100 via-emerald-100 to-emerald-400 bg-clip-text text-transparent">
-              NaturePose Engine
-            </h1>
+    <div className="min-h-screen bg-[#f6f7f1] text-[#1e211a] font-sans antialiased selection:bg-[#3d8f3d] selection:text-white">
+      {/* Accessibility Skip Link */}
+      <a href="#main-dashboard" className="sr-only focus:not-sr-only focus:absolute focus:top-4 focus:left-4 bg-[#2e722e] text-[#fdfbf7] px-4 py-2 rounded shadow">
+        Skip to main content
+      </a>
+
+      {/* Navigation Header */}
+      <header className="bg-[#193919] text-[#fdfbf7] shadow-md border-b-4 border-[#3d8f3d]" role="banner">
+        <div className="max-w-7xl mx-auto px-4 py-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row justify-between items-center gap-4">
+          <div className="flex items-center gap-3">
+            <span className="text-3xl" aria-hidden="true">🌿</span>
+            <div>
+              <h1 className="text-2xl font-bold tracking-tight">NaturePose</h1>
+              <p className="text-xs text-[#b4bda0]">Eco-Themed Real-Time AI Running Form Coach</p>
+            </div>
           </div>
-          <p className="text-stone-400 text-sm mt-1">Biomechanical alignment via neural reinforcement networks</p>
-        </div>
-
-        <div className="flex items-center gap-3 w-full md:w-auto">
-          {/* Audio Queue Mute Control */}
-          <button
-            onClick={handleMuteToggle}
-            className={`p-3 rounded-xl border transition-all duration-300 flex items-center justify-center ${
-              voiceMuted 
-                ? 'bg-stone-900 border-stone-800 text-stone-500 hover:text-stone-400' 
-                : 'bg-emerald-950/40 border-emerald-800/50 text-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.1)]'
-            }`}
-            title={voiceMuted ? "Unmute Voice Feedback" : "Mute Voice Feedback"}
-          >
-            {voiceMuted ? (
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2" /></svg>
-            ) : (
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" /></svg>
-            )}
-          </button>
-
-          {/* Core Pipeline Switch */}
-          {!currentSession ? (
+          <div className="flex items-center gap-4">
             <button
-              onClick={() => { start(); startSession(activity); }}
-              className="flex-1 md:flex-none px-6 py-3 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-semibold rounded-xl transition-all shadow-[0_4px_20px_rgba(16,185,129,0.2)] hover:shadow-[0_4px_25px_rgba(16,185,129,0.3)] active:scale-[0.98]"
+              onClick={() => setVoiceMuted(!voiceMuted)}
+              className={`flex items-center gap-2 px-4 py-2 rounded-full font-medium transition focus:outline-none focus:ring-2 focus:ring-[#85c985] text-sm ${
+                voiceMuted ? 'bg-amber-800 text-amber-100 hover:bg-amber-700' : 'bg-[#2e722e] text-[#fdfbf7] hover:bg-[#245a24]'
+              }`}
+              aria-label={voiceMuted ? "Unmute voice coaching" : "Mute voice coaching"}
             >
-              Initialize Coaching Session
+              <span>{voiceMuted ? '🔇 Voice Off' : '🔊 Voice On'}</span>
             </button>
-          ) : (
-            <button
-              onClick={() => { stop(); endSession(); setMetrics(null); setLiveAction(null); }}
-              className="flex-1 md:flex-none px-6 py-3 bg-gradient-to-r from-rose-600 to-orange-600 hover:from-rose-500 hover:to-orange-500 text-white font-semibold rounded-xl transition-all shadow-[0_4px_20px_rgba(244,63,94,0.2)] active:scale-[0.98]"
-            >
-              Terminate & Save Session
-            </button>
-          )}
+          </div>
         </div>
       </header>
 
-      {/* ERROR CORRECTION STATUS SLATE */}
-      {cameraError && (
-        <div className="max-w-7xl mx-auto mb-6 p-4 bg-rose-950/40 border border-rose-800/50 rounded-xl text-rose-300 flex items-center gap-3 text-sm">
-          <span className="h-2 w-2 rounded-full bg-rose-500 animate-ping" />
-          <strong>Hardware Notice:</strong> {cameraError}
-        </div>
-      )}
-
-      {/* CORE WORKSPACE GRID */}
-      <main className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8">
+      {/* Main Container */}
+      <main id="main-dashboard" className="max-w-7xl mx-auto px-4 py-6 sm:px-6 lg:px-8 space-y-6" role="main">
         
-        {/* LEFT ASPECT SECTION: VISUAL HUD STREAM CONTAINER */}
-        <section className="lg:col-span-7 xl:col-span-8 flex flex-col gap-6">
-          <div className="relative w-full aspect-video rounded-2xl bg-stone-950 overflow-hidden border border-stone-800 shadow-inner group">
-            
-            {/* Mirror Processed Camera Sub-layers */}
-            <video ref={videoRef} className="hidden" playsInline muted />
-            <canvas 
-              ref={canvasRef} 
-              className={`w-full h-full object-cover transition-transform duration-500 scale-x-[-1] ${
-                isCameraActive ? 'opacity-100' : 'opacity-20'
-              }`} 
-            />
-
-            {/* PIPELINE DISCONNECTED DEFAULT VIEW SPLASH */}
-            {!isCameraActive && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center bg-stone-950/60 backdrop-blur-sm transition-opacity duration-300">
-                <div className="p-4 bg-stone-900/80 rounded-2xl border border-stone-800 text-emerald-500/80 mb-3 group-hover:scale-105 transition-transform">
-                  <svg xmlns="http://www.w3.org/2000/svg" className="h-10 w-10" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
-                </div>
-                <h3 className="text-lg font-semibold text-stone-200">Optical Pipeline Offline</h3>
-                <p className="text-sm text-stone-400 max-w-sm mt-1">Click the initialization trigger above to engage hardware camera resources.</p>
-              </div>
-            )}
-
-            {/* LIVE DYNAMIC VISUAL HUD ALERTS */}
-            {isCameraActive && framingGuide && framingGuide.status !== 'good' && (
-              <div className="absolute top-4 left-4 right-4 bg-amber-950/80 backdrop-blur-md px-4 py-3 rounded-xl border border-amber-500/40 text-amber-300 text-xs md:text-sm flex items-center gap-3 animate-fade-in shadow-lg">
-                <span className="flex h-2 w-2 rounded-full bg-amber-400 animate-ping" />
-                <p><strong>Framing Warning:</strong> {framingGuide.message}</p>
-              </div>
-            )}
+        {/* Step 1: Configuration Tab Row */}
+        <section className="bg-white rounded-xl shadow-sm border border-[#e8ebe0] p-4" aria-labelledby="activity-heading">
+          <h2 id="activity-heading" className="text-sm font-semibold uppercase tracking-wider text-[#626b50] mb-3">
+            Select Coaching Activity
+          </h2>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2" role="tablist" aria-label="Activity tracking modes">
+            {(['running', 'walking', 'yoga', 'sitting'] as ActivityKind[]).map((mode) => (
+              <button
+                key={mode}
+                role="tab"
+                aria-selected={activity === mode}
+                onClick={() => setActivity(mode)}
+                disabled={!!currentSession}
+                className={`py-3 px-4 rounded-lg font-medium text-sm border transition capitalize ${
+                  activity === mode
+                    ? 'bg-[#2e722e] text-[#fdfbf7] border-[#1d471d] shadow-sm'
+                    : 'bg-[#fdfbf7] border-[#d2d7c2] text-[#4e5540] hover:bg-[#e8ebe0] disabled:opacity-40'
+                }`}
+              >
+                {mode === 'running' && '🏃 '}
+                {mode === 'walking' && '🚶 '}
+                {mode === 'yoga' && '🧘 '}
+                {mode === 'sitting' && '🪑 '}
+                {mode}
+              </button>
+            ))}
           </div>
-
-          {/* NEURAL MODEL TEXT RECOVERY TEXT OUTLET */}
-          <div className="bg-stone-900/60 border border-stone-800 p-6 rounded-2xl shadow-xl backdrop-blur-sm relative overflow-hidden">
-            <div className="absolute top-0 left-0 w-1.5 h-full bg-emerald-500" />
-            <span className="text-xs uppercase tracking-widest font-bold text-emerald-500 block mb-1">Active Neural Target Model Directive</span>
-            <h2 className="text-xl md:text-2xl font-bold tracking-tight text-white transition-all duration-300">
-              {liveAction ? liveAction.text : "Awaiting motion tracking frame stream..."}
-            </h2>
-          </div>
+          {currentSession && (
+            <p className="text-xs text-amber-700 mt-2 font-medium">
+              ⚠️ Complete your active recording session to change tracking activities.
+            </p>
+          )}
         </section>
 
-        {/* RIGHT ASPECT SECTION: METRICS TELEMETRY PANELS */}
-        <section className="lg:col-span-5 xl:col-span-4 flex flex-col gap-6">
+        {/* Multi-Column Feed Dashboard View */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           
-          {/* METRICS INTERACTIVE HEADER GAUGES */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 gap-6">
-            
-            {/* COMPOSITE METRICS RADIAL CARD */}
-            <div className={`bg-stone-900/40 border rounded-2xl p-6 flex flex-col items-center text-center backdrop-blur-sm transition-all duration-500 ${scoreColorClass}`}>
-              <span className="text-stone-400 text-xs uppercase tracking-wider font-semibold mb-3">Kinetic Alignment Score</span>
-              <div className="relative flex items-center justify-center w-28 h-28 my-2">
-                <svg className="w-full h-full transform -rotate-90" viewBox="0 0 36 36">
-                  <path className="text-stone-800" strokeWidth="3" stroke="currentColor" fill="none" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
-                  <path className="transition-all duration-500 ease-out" strokeDasharray={`${formScore}, 100`} strokeWidth="3" strokeLinecap="round" stroke="currentColor" fill="none" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
-                </svg>
-                <div className="absolute text-3xl font-black text-stone-100 tracking-tight">
-                  {formScore}<span className="text-xs text-stone-400 font-normal">%</span>
-                </div>
+          {/* Vision Panel Feed Box */}
+          <div className="lg:col-span-7 space-y-4">
+            <div className="bg-white rounded-xl shadow-sm border border-[#e8ebe0] p-4 flex flex-col">
+              <div className="flex justify-between items-center mb-3">
+                <h3 className="font-bold text-[#245a24] text-lg flex items-center gap-2">
+                  <span className="h-2.5 w-2.5 rounded-full bg-emerald-500 inline-block animate-pulse"></span>
+                  Vision Tracking Feed
+                </h3>
+                <span className="text-xs bg-[#e8ebe0] text-[#4e5540] px-2.5 py-1 rounded-md font-medium">
+                  {isCameraActive ? '📷 Active' : '💤 Offline'}
+                </span>
               </div>
-              <p className="text-stone-300 text-xs mt-3 max-w-[200px]">Composite accuracy of joint angle models across tracking sets.</p>
-            </div>
 
-            {/* DYNAMIC SPATIAL CADENCE CARD */}
-            <div className="bg-stone-900/40 border border-stone-800 rounded-2xl p-6 flex flex-col items-center justify-center text-center backdrop-blur-sm">
-              <span className="text-stone-400 text-xs uppercase tracking-wider font-semibold mb-2">Estimated Cadence</span>
-              <div className="text-5xl font-black tracking-tight text-white my-2 flex items-baseline gap-1">
-                {metrics ? metrics.cadence : 0}
-                <span className="text-xs font-medium text-stone-500 tracking-normal">SPM</span>
-              </div>
-              <div className="w-full bg-stone-800 h-1 rounded-full overflow-hidden mt-3 max-w-[150px]">
-                <div 
-                  className="bg-emerald-500 h-full transition-all duration-500"
-                  style={{ width: `${Math.min(((metrics?.cadence ?? 0) / 200) * 100, 100)}%` }}
+              {/* Viewfinder Canvas Stack */}
+              <div className="relative w-full aspect-video bg-neutral-900 rounded-lg overflow-hidden flex items-center justify-center border border-neutral-800">
+                {!isCameraActive && (
+                  <div className="absolute text-center px-4">
+                    <p className="text-neutral-400 text-sm mb-3">Camera capture is currently stopped</p>
+                    <button
+                      onClick={toggleCamera}
+                      className="bg-[#2e722e] text-white hover:bg-[#245a24] px-5 py-2 rounded-lg text-sm font-medium transition focus:ring-2 focus:ring-offset-2 focus:ring-[#3d8f3d]"
+                    >
+                      Initialize Camera Feed
+                    </button>
+                  </div>
+                )}
+
+                {cameraError && (
+                  <div className="absolute inset-0 bg-red-950/90 text-red-200 p-4 flex items-center justify-center text-center text-sm">
+                    ❌ {cameraError}. Please verify hardware options and site permissions.
+                  </div>
+                )}
+
+                <video
+                  ref={videoRef}
+                  className={`w-full h-full object-cover ${isCameraActive ? 'block' : 'hidden'}`}
+                  muted
+                  playsInline
+                />
+                <canvas
+                  ref={canvasRef}
+                  className="absolute top-0 left-0 w-full h-full object-cover pointer-events-none"
                 />
               </div>
-              <p className="text-stone-400 text-[11px] mt-2">Steps per minute calculated from ankle vertical velocity mapping.</p>
+
+              {/* Live Session Controls */}
+              <div className="mt-4 flex flex-wrap gap-2">
+                <button
+                  onClick={toggleCamera}
+                  className={`px-4 py-2.5 rounded-lg text-sm font-medium transition ${
+                    isCameraActive 
+                      ? 'bg-neutral-200 text-neutral-800 hover:bg-neutral-300' 
+                      : 'bg-[#2e722e] text-white hover:bg-[#245a24]'
+                  }`}
+                >
+                  {isCameraActive ? 'Turn Off Camera' : 'Start Camera'}
+                </button>
+
+                {isCameraActive && (
+                  <button
+                    onClick={currentSession ? handleEndSession : handleStartSession}
+                    className={`px-5 py-2.5 rounded-lg text-sm font-medium transition shadow-sm ${
+                      currentSession
+                        ? 'bg-red-600 text-white hover:bg-red-700 font-bold animate-pulse'
+                        : 'bg-emerald-700 text-white hover:bg-emerald-800'
+                    }`}
+                  >
+                    {currentSession ? '⏹️ Stop & Save Session' : '⏺️ Record Form Metrics'}
+                  </button>
+                )}
+              </div>
             </div>
           </div>
 
-          {/* LINEAR EXTENSION SPATIAL TRACKERS SLATE */}
-          <div className="bg-stone-900/40 border border-stone-800 rounded-2xl p-6 flex flex-col gap-5 backdrop-blur-sm">
-            <h3 className="text-sm font-bold text-stone-200 uppercase tracking-wide border-b border-stone-800 pb-3">Real-time Joint Metrics</h3>
+          {/* Metrics & AI Coaching Analytics Column */}
+          <div className="lg:col-span-5 space-y-4">
             
-            {/* TRACKER ELEMENT: TORSO LEAN */}
-            <div className="space-y-1.5">
-              <div className="flex justify-between text-xs">
-                <span className="text-stone-400 font-medium">Torso Forward Lean</span>
-                <span className="text-stone-200 font-bold">{metrics ? Math.round(metrics.torsoLean) : 0}°</span>
+            {/* AI Coaching Box */}
+            <div className="bg-[#1d471d] text-[#fdfbf7] rounded-xl shadow-sm p-5 border-l-4 border-[#85c985]">
+              <h3 className="text-xs font-bold uppercase tracking-widest text-[#b4bda0] mb-2">
+                🤖 AI Form Reinforcement Coach
+              </h3>
+              <div className="bg-[#193919] rounded-lg p-4 border border-[#245a24]">
+                <p className="text-lg font-medium leading-relaxed italic text-[#f2e4ce]">
+                  "{coachFeedback}"
+                </p>
               </div>
-              <div className="bg-stone-800 h-2 rounded-lg overflow-hidden">
-                <div 
-                  className="bg-teal-500 h-full transition-all duration-300"
-                  style={{ width: `${Math.min(((metrics?.torsoLean ?? 0) / 45) * 100, 100)}%` }}
-                />
-              </div>
-            </div>
-
-            {/* TRACKER ELEMENT: LEFT KNEE COMPRESSION */}
-            <div className="space-y-1.5">
-              <div className="flex justify-between text-xs">
-                <span className="text-stone-400 font-medium">Left Knee Extension</span>
-                <span className="text-stone-200 font-bold">{metrics ? Math.round(metrics.kneeLeft) : 0}°</span>
-              </div>
-              <div className="bg-stone-800 h-2 rounded-lg overflow-hidden">
-                <div 
-                  className="bg-emerald-400 h-full transition-all duration-300"
-                  style={{ width: `${Math.min(((metrics?.kneeLeft ?? 0) / 180) * 100, 100)}%` }}
-                />
+              <div className="mt-3 flex items-center justify-between text-xs text-[#b4bda0]">
+                <span>Strategy: Deep Q-Policy Network</span>
+                <span>Status: {model ? 'Model Connected' : 'Loading Model Weights...'}</span>
               </div>
             </div>
 
-            {/* TRACKER ELEMENT:
+            {/* Metrics Checklist Display */}
+            <div className="bg-white rounded-xl shadow-sm border border-[#e8ebe0] p-5 space-y-4">
+              <div className="flex justify-between items-baseline border-b border-[#e8ebe0] pb-2">
+                <h3 className="font-bold text-[#1e211a] text-base">Real-Time Kinematics</h3>
+                <span className="text-sm font-bold text-[#2e722e]">
+                  Form Score: {metrics ? metrics.score : '--'}/100
+                </span>
+              </div>
+
+              {metrics ? (
+                <div className="grid grid-cols-2 gap-4 text-sm">
+                  <div className="bg-[#f6f7f1] p-3 rounded-lg border border-[#e8ebe0]">
+                    <span className="block text-xs text-[#626b50] font-medium">Avg Knee Flexion</span>
+                    <span className="text-lg font-bold text-[#245a24]">{Math.round(metrics.kneeAvg || 0)}°</span>
+                  </div>
+                  <div className="bg-[#f6f7f1] p-3 rounded-lg border border-[#e8ebe0]">
+                    <span className="block text-xs text-[#626b50] font-medium">Forward Torso Lean</span>
+                    <span className="text-lg font-bold text-[#245a24]">{Math.round(metrics.torsoLean || 0)}°</span>
+                  </div>
+                  <div className="bg-[#f6f7f1] p-3 rounded-lg border border-[#e8ebe0]">
+                    <span className="block text-xs text-[#626b50] font-medium">Arm Swing Extent</span>
+                    <span className="text-lg font-bold text-[#245a24]">{Math.round((metrics.armSwingRatio || 0) * 100)}%</span>
+                  </div>
+                  <div className="bg-[#f6f7f1] p-3 rounded-lg border border-[#e8ebe0]">
+                    <span className="block text-xs text-[#626b50] font-medium">Cadence Count</span>
+                    <span className="text-lg font-bold text-[#245a24]">{metrics.cadence || 0} SPM</span>
+                  </div>
+                  <div className="bg-[#f6f7f1] p-3 rounded-lg border border-[#e8ebe0] col-span-2 flex justify-between items-center">
+                    <span className="text-xs text-[#626b50] font-medium">Heel Strike Landing Over-stride</span>
+                    <span className={`px-2.5 py-0.5 rounded text-xs font-bold ${metrics.isHeelStrike ? 'bg-amber-100 text-amber-800' : 'bg-green-100 text-green-800'}`}>
+                      {metrics.isHeelStrike ? '⚠️ Heel Strike Detected' : '✅ Optimal Forefoot/Midfoot'}
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                <div className="py-8 text-center text-sm text-[#97a27e]">
+                  No tracking vectors found. Step into frame to monitor joint mechanics.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* History Log Section */}
+        <section className="bg-white rounded-xl shadow-sm border border-[#e8ebe0] p-5" aria-labelledby="history-heading">
+          <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center border-b border-[#e8ebe0] pb-3 mb-4 gap-3">
+            <div>
+              <h2 id="history-heading" className="text-lg font-bold text-[#1e211a]">
+                Eco-Training Session History
+              </h2>
+              <p className="text-xs text-[#626b50]">Your localized database logs saved to this client</p>
+            </div>
+            {sessions.length > 0 && (
+              <button
+                onClick={exportHistoryToCSV}
+                className="bg-white border border-[#d2d7c2] hover:bg-[#f6f7f1] text-[#4e5540] px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5"
+              >
+                📥 Export Logs to CSV
+              </button>
+            )}
+          </div>
+
+          {sessions.length === 0 ? (
+            <div className="text-center py-8 text-[#97a27e] text-sm">
+              No historical data in local storage. Record your first movement set to begin!
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm border-collapse" role="table">
+                <thead>
+                  <tr className="border-b border-[#d2d7c2] text-[#626b50] bg-[#f6f7f1]">
+                    <th className="p-3 font-semibold">Date Timestamp</th>
+                    <th className="p-3 font-semibold">Activity</th>
+                    <th className="p-3 font-semibold">Duration</th>
+                    <th className="p-3 font-semibold">Avg Competency</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#e8ebe0]">
+                  {sessions.slice().reverse().map((session) => (
+                    <tr key={session.id} className="hover:bg-[#fdfbf7] transition">
+                      <td className="p-3 text-xs tabular-nums text-[#4e5540]">{session.date}</td>
+                      <td className="p-3 capitalize font-medium">{session.activity}</td>
+                      <td className="p-3 text-xs tabular-nums">
+                        {Math.floor(session.durationMs / 60000)}m {Math.round((session.durationMs % 60000) / 1000)}s
+                      </td>
+                      <td className="p-3 font-bold text-[#2e722e]">
+                        {session.averageScore}/100
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      </main>
+    </div>
+  );
+}
