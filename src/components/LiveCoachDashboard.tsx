@@ -14,9 +14,11 @@ export function LiveCoachDashboard() {
   // Contexts
   const { activity, setActivity, voiceMuted, setVoiceMuted } = useSettings();
   const { currentSession, sessions, startSession, recordFrame, endSession } = useSession();
-  // From: const { metrics, keypoints } = usePose();
-const { metrics } = usePose();
+  const { metrics } = usePose();
   const updatePose = usePoseUpdate();
+
+  // Positioning State
+  const [frameStatus, setFrameStatus] = useState<'good' | 'too-close' | 'missing-body'>('good');
 
   // Custom Hooks
   const { videoRef, start: startCamera, stop: stopCamera, isActive: isCameraActive, error: cameraError } = useCamera('user');
@@ -24,9 +26,34 @@ const { metrics } = usePose();
   const { speak, stop: stopVoice } = useVoiceCoach();
 
   // States
-const [model, setModel] = useState<any>(null);
+  const [model, setModel] = useState<any>(null);
   const [coachFeedback, setCoachFeedback] = useState<string>('Awaiting motion input to coach your form...');
   const lastFeedbackTime = useRef<number>(0);
+
+  // Helper function to validate user proximity and frame composition
+  const checkUserPosition = (keypoints: any[], canvasWidth: number): 'good' | 'too-close' | 'missing-body' => {
+    if (!keypoints || keypoints.length === 0) return 'missing-body';
+
+    const nose = keypoints.find(k => k.name === 'nose' || k.id === 0);
+    const leftShoulder = keypoints.find(k => k.name === 'left_shoulder' || k.id === 5);
+    const rightShoulder = keypoints.find(k => k.name === 'right_shoulder' || k.id === 6);
+
+    // 1. If critical keypoints are missing or hidden, upper body is cut out of frame
+    if (!nose || !leftShoulder || !rightShoulder || nose.score < 0.5 || leftShoulder.score < 0.5 || rightShoulder.score < 0.5) {
+      return 'missing-body';
+    }
+
+    // 2. Calculate the pixel distance between shoulders
+    const shoulderWidth = Math.abs(leftShoulder.x - rightShoulder.x);
+    const proximityRatio = shoulderWidth / (canvasWidth || 640);
+    
+    // If shoulders span more than 42% of viewfinder, they are too close
+    if (proximityRatio > 0.42) {
+      return 'too-close';
+    }
+
+    return 'good';
+  };
 
   // Load the AI Coach Policy on mount
   useEffect(() => {
@@ -51,15 +78,40 @@ const [model, setModel] = useState<any>(null);
 
   // Handle frame analysis results
   const handlePoseResult = (latestMetrics: RunningMetrics, latestKeypoints: any[]) => {
-    // 1. Update the shared pose context tracking state
+    // 1. Validate framing vectors before executing coaching analytics
+    const videoWidth = videoRef.current?.videoWidth || 640;
+    const positioning = checkUserPosition(latestKeypoints, videoWidth);
+    setFrameStatus(positioning);
+
+    // Update shared context
     updatePose(latestKeypoints, latestMetrics, 0);
 
-    // 2. Evaluate Form via the AI RL Model or fall back to standard metrics
     let actionText = 'Form is stable. Maintain your rhythm.';
     let actionId = 'stable';
 
+    // 2. Intercept and override tracking loop if framing parameters are out of bounds
+    if (positioning !== 'good') {
+      if (positioning === 'too-close') {
+        actionId = 'too-close';
+        actionText = 'Please sit a little further back to get in frame.';
+      } else {
+        actionId = 'missing-body';
+        actionText = 'Step back or adjust camera to show your upper body.';
+      }
+
+      setCoachFeedback(actionText);
+
+      // Speak proximity alerts instantly to prompt the user
+      const now = performance.now();
+      if (!voiceMuted && now - lastFeedbackTime.current > 4000) {
+        speak(actionText);
+        lastFeedbackTime.current = now;
+      }
+      return; // Halt AI evaluations and drop database recording steps for corrupted frames
+    }
+
+    // 3. Evaluate Form via the AI RL Model or fall back to standard metrics
     if (model && latestMetrics) {
-      // Normalize metrics into standard input vector for the policy neural network
       const inputVector = [
         latestMetrics.kneeLeft || 0,
         latestMetrics.kneeRight || 0,
@@ -69,15 +121,12 @@ const [model, setModel] = useState<any>(null);
       ];
       
       const actionIndex = evaluatePoseRL(model, inputVector);
-      
 
-      //  Directly read the properties from the coach action object
-if (actionIndex) {
-  actionId = actionIndex.actionId; 
-  actionText = actionIndex.text;
-}
+      if (actionIndex) {
+        actionId = actionIndex.actionId; 
+        actionText = actionIndex.text;
+      }
     } else if (latestMetrics) {
-      // Rule-based feedback fallback if model is still loading
       if (latestMetrics.torsoLean > 15) {
         actionId = 'posture';
         actionText = 'Reduce forward lean. Engage your core.';
@@ -89,21 +138,21 @@ if (actionIndex) {
 
     setCoachFeedback(actionText);
 
-    // 3. Trigger Voice Feedback every 4 seconds max to avoid speaking overlaps
+    // 4. Trigger Voice Feedback every 4 seconds max
     const now = performance.now();
     if (!voiceMuted && now - lastFeedbackTime.current > 4000) {
       speak(actionText);
       lastFeedbackTime.current = now;
     }
 
-    // 4. Append frame metrics to database if a recording session is running
+    // 5. Append clean frame metrics to data collection layers
     if (currentSession) {
       recordFrame(latestMetrics.score || 0, [{ 
-  actionId, 
-  text: actionText, 
-  advice: actionText, 
-  voiceCue: actionText 
-}]);
+        actionId, 
+        text: actionText, 
+        advice: actionText, 
+        voiceCue: actionText 
+      }]);
     }
   };
 
@@ -133,6 +182,7 @@ if (actionIndex) {
     if (isCameraActive) {
       if (currentSession) await handleEndSession();
       stopCamera();
+      setFrameStatus('good'); // Reset framing flag on camera shutdown
     } else {
       await startCamera();
     }
@@ -147,7 +197,6 @@ if (actionIndex) {
     await endSession();
   };
 
-  // Export Session History log to CSV formatted spreadsheet
   const exportHistoryToCSV = () => {
     if (sessions.length === 0) return;
     const headers = ['ID', 'Date', 'Activity', 'Duration (s)', 'Average Score'];
@@ -284,6 +333,44 @@ if (actionIndex) {
                   ref={canvasRef}
                   className="absolute top-0 left-0 w-full h-full object-cover pointer-events-none"
                 />
+
+                {/* 1. VISUAL POSTURE SILHOUETTE OVERLAY */}
+                {frameStatus !== 'good' && isCameraActive && (
+                  <div className="absolute inset-0 pointer-events-none flex items-center justify-center bg-slate-950/40 backdrop-blur-[2px] transition-all duration-300">
+                    <svg 
+                      className={`w-52 h-52 transition-transform duration-500 ${
+                        frameStatus === 'too-close' ? 'scale-125 text-amber-500/60 animate-pulse' : 'text-rose-500/40'
+                      }`} 
+                      viewBox="0 0 24 24" 
+                      fill="none" 
+                      stroke="currentColor" 
+                      strokeWidth="1.2"
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 6a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0ZM4.501 20.118a7.5 7.5 0 0 1 14.998 0A17.933 17.933 0 0 1 12 21.75c-2.676 0-5.216-.584-7.499-1.632Z" />
+                    </svg>
+                  </div>
+                )}
+
+                {/* 2. DYNAMIC ACTIONABLE INSTRUCTION TEXT BANNER */}
+                {frameStatus !== 'good' && isCameraActive && (
+                  <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 w-11/12 max-w-sm transition-all">
+                    <div className={`p-3 rounded-xl shadow-xl text-center text-white text-xs font-semibold border ${
+                      frameStatus === 'too-close' 
+                        ? 'bg-amber-600/95 border-amber-400 backdrop-blur-md' 
+                        : 'bg-rose-600/95 border-rose-400 backdrop-blur-md'
+                    }`}>
+                      {frameStatus === 'too-close' ? (
+                        <p className="flex items-center justify-center gap-2">
+                          <span>↔️</span> Please sit a little further back to get in frame.
+                        </p>
+                      ) : (
+                        <p className="flex items-center justify-center gap-2">
+                          <span>📷</span> Step back or adjust camera to show your upper body.
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Live Session Controls */}
